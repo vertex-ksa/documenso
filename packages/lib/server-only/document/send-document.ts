@@ -160,14 +160,6 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
     throw new Error('Missing envelope items');
   }
 
-  if (envelope.formValues && envelope.status === DocumentStatus.DRAFT) {
-    await Promise.all(
-      envelope.envelopeItems.map(async (envelopeItem) => {
-        await injectFormValuesIntoDocument(envelope, envelopeItem);
-      }),
-    );
-  }
-
   // Validate that recipients with auth requirements have a valid email.
   envelope.recipients.forEach((recipient) => {
     const auth = extractDocumentAuthMethods({
@@ -197,6 +189,15 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
     throw new AppError(AppErrorCode.MISSING_SIGNATURE_FIELD, {
       message: `The following recipients are missing required fields: ${missingRecipientDescriptions}. Signers must have at least one signature field.`,
     });
+  }
+
+  // Complete recipient validation before persisting prefilled PDF replacements.
+  if (envelope.formValues && envelope.status === DocumentStatus.DRAFT) {
+    await Promise.all(
+      envelope.envelopeItems.map(async (envelopeItem) => {
+        await injectFormValuesIntoDocument(envelope, envelopeItem);
+      }),
+    );
   }
 
   const allRecipientsHaveNoActionToTake = envelope.recipients.every(
@@ -521,3 +522,4 @@ export const extractFieldAutoInsertValues = (
 
   return null;
 };
+
