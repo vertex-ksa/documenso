@@ -11,6 +11,7 @@ import {
   DocumentStatus,
   EnvelopeType,
   FieldType,
+  Prisma,
   RecipientRole,
   SendStatus,
   SigningStatus,
@@ -40,6 +41,7 @@ import { type EnvelopeIdOptions, mapSecondaryIdToDocumentId } from '../../utils/
 import { toCheckboxCustomText, toRadioCustomText } from '../../utils/fields';
 import { getRecipientsWithMissingFields, isRecipientEmailValidForSending } from '../../utils/recipients';
 import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
+import { assertInternalDraftSendPolicy } from '../envelope/internal-draft-send-policy';
 import { insertFormValuesInPdf } from '../pdf/insert-form-values-in-pdf';
 import { assertUserNotDisabledById } from '../user/assert-user-not-disabled';
 import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
@@ -52,7 +54,50 @@ export type SendDocumentOptions = {
   requestMetadata: ApiRequestMetadata;
 };
 
-export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetadata }: SendDocumentOptions) => {
+type NativeSendContext = {
+  tx: Prisma.TransactionClient;
+  prepared: boolean;
+  approved: boolean;
+  enqueue: (effect: Prisma.InputJsonObject) => Promise<void>;
+};
+
+export const sendDocument = async (options: SendDocumentOptions) => {
+  const effects: Prisma.InputJsonObject[] = [];
+  const result = await prisma.$transaction(
+    (tx) =>
+      sendDocumentWithContext(options, {
+        tx,
+        prepared: false,
+        approved: false,
+        enqueue: async (effect) => {
+          effects.push(JSON.parse(JSON.stringify(effect)));
+        },
+      }),
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeout: 60000 },
+  );
+  for (const effect of effects) {
+    if (effect.kind === 'JOB') {
+      await jobs.triggerJob(effect.options as Parameters<typeof jobs.triggerJob>[0]);
+    } else {
+      await triggerWebhook(effect.options as Parameters<typeof triggerWebhook>[0]);
+    }
+  }
+  return result;
+};
+
+// Server-only transaction context supplied by the native send wrapper or approval executor.
+// Public routes continue calling sendDocument and cannot supply this context.
+export const sendDocumentWithContext = async (
+  { id, userId, teamId, sendEmail, requestMetadata }: SendDocumentOptions,
+  context?: NativeSendContext,
+) => {
+  const db = context?.tx ?? prisma;
+  const dispatchJob = async (options: Parameters<typeof jobs.triggerJob>[0]) => {
+    if (context) {
+      return context.enqueue({ kind: 'JOB', options: options as Prisma.InputJsonObject });
+    }
+    return jobs.triggerJob(options);
+  };
   // Refuse to send on behalf of a disabled account. Guards distribute /
   // redistribute / template-use routes, the bulk-send job, and direct
   // templates that auto-send on creation.
@@ -65,7 +110,7 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
     teamId,
   });
 
-  const envelope = await prisma.envelope.findFirst({
+  const envelope = await db.envelope.findFirst({
     where: envelopeWhereInput,
     include: {
       recipients: {
@@ -104,6 +149,12 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
 
   if (!envelope) {
     throw new Error('Document not found');
+  }
+  if (context) {
+    await context.tx.$queryRaw`SELECT "id" FROM "Envelope" WHERE "id" = ${envelope.id} FOR UPDATE`;
+  }
+  if (!context?.approved) {
+    await assertInternalDraftSendPolicy(envelope.id, db);
   }
 
   if (envelope.recipients.length === 0) {
@@ -209,7 +260,7 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
       `[CSC] Coercing signingOrder=PARALLEL → SEQUENTIAL for ${envelope.signatureLevel} envelope ${envelope.id} at send time. The schema-layer guard should have caught this earlier.`,
     );
 
-    await prisma.documentMeta.update({
+    await db.documentMeta.update({
       where: {
         id: envelope.documentMeta.id,
       },
@@ -224,16 +275,16 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
   }
 
   // Complete recipient and action-field validation before persisting send preparation.
-  if (envelope.formValues && envelope.status === DocumentStatus.DRAFT) {
+  if (!context?.prepared && envelope.formValues && envelope.status === DocumentStatus.DRAFT) {
     await Promise.all(
       envelope.envelopeItems.map(async (envelopeItem) => {
-        await injectFormValuesIntoDocument(envelope, envelopeItem);
+        await injectFormValuesIntoDocument(envelope, envelopeItem, db);
       }),
     );
   }
 
   if (allRecipientsHaveNoActionToTake) {
-    await jobs.triggerJob({
+    await dispatchJob({
       name: 'internal.seal-document',
       payload: {
         documentId: legacyDocumentId,
@@ -242,7 +293,7 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
     });
 
     // Keep the return type the same for the `sendDocument` method
-    return await prisma.envelope.findFirstOrThrow({
+    return await db.envelope.findFirstOrThrow({
       where: {
         id: envelope.id,
       },
@@ -253,13 +304,14 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
     });
   }
 
-  if (isTspEnvelope(envelope) && envelope.status === DocumentStatus.DRAFT) {
+  if (!context?.prepared && isTspEnvelope(envelope) && envelope.status === DocumentStatus.DRAFT) {
     await materializeTspAnchorsForEnvelope({
       envelopeId: envelope.id,
+      tx: context?.tx,
     });
   }
 
-  const updatedEnvelope = await prisma.$transaction(async (tx) => {
+  const commitSend = async (tx: Prisma.TransactionClient) => {
     if (envelope.status === DocumentStatus.DRAFT) {
       await tx.documentAuditLog.create({
         data: createDocumentAuditLogData({
@@ -337,7 +389,8 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
         recipients: true,
       },
     });
-  });
+  };
+  const updatedEnvelope = context ? await commitSend(context.tx) : await prisma.$transaction(commitSend);
 
   const isRecipientSigningRequestEmailEnabled = extractDerivedDocumentEmailSettings(
     envelope.documentMeta,
@@ -353,7 +406,7 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
           return;
         }
 
-        await jobs.triggerJob({
+        await dispatchJob({
           name: 'send.signing.requested.email',
           payload: {
             userId,
@@ -366,12 +419,17 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
     );
   }
 
-  await triggerWebhook({
+  const webhookOptions = {
     event: WebhookTriggerEvents.DOCUMENT_SENT,
     data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(updatedEnvelope)),
     userId,
     teamId,
-  });
+  };
+  if (context) {
+    await context.enqueue({ kind: 'WEBHOOK', options: webhookOptions as Prisma.InputJsonObject });
+  } else {
+    await triggerWebhook(webhookOptions);
+  }
 
   return updatedEnvelope;
 };
@@ -379,6 +437,7 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
 const injectFormValuesIntoDocument = async (
   envelope: Envelope,
   envelopeItem: Pick<EnvelopeItem, 'id'> & { documentData: DocumentData },
+  db: Prisma.TransactionClient | typeof prisma = prisma,
 ) => {
   const file = await getFileServerSide(envelopeItem.documentData);
 
@@ -394,13 +453,17 @@ const injectFormValuesIntoDocument = async (
     fileName = `${envelope.title}.pdf`;
   }
 
-  const newDocumentData = await putNormalizedPdfFileServerSide({
-    name: fileName,
-    type: 'application/pdf',
-    arrayBuffer: async () => Promise.resolve(prefilled),
-  });
+  const newDocumentData = await putNormalizedPdfFileServerSide(
+    {
+      name: fileName,
+      type: 'application/pdf',
+      arrayBuffer: async () => Promise.resolve(prefilled),
+    },
+    {},
+    db,
+  );
 
-  await prisma.envelopeItem.update({
+  await db.envelopeItem.update({
     where: {
       id: envelopeItem.id,
     },

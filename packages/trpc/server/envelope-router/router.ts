@@ -7,6 +7,8 @@ import { bulkCancelEnvelopesRoute } from './bulk-cancel-envelopes';
 import { bulkDeleteEnvelopesRoute } from './bulk-delete-envelopes';
 import { bulkMoveEnvelopesRoute } from './bulk-move-envelopes';
 import { cancelEnvelopeRoute } from './cancel-envelope';
+import { changeInternalDraftReviewLifecycleRoute } from './change-internal-draft-review-lifecycle';
+import { configureInternalDraftApprovalPolicyRoute } from './configure-internal-draft-approval-policy';
 import { createEnvelopeRoute } from './create-envelope';
 import { createEnvelopeItemsRoute } from './create-envelope-items';
 import { decideInternalDraftReviewRoute } from './decide-internal-draft-review';
@@ -28,6 +30,7 @@ import { getEnvelopeRecipientRoute } from './envelope-recipients/get-envelope-re
 import { rejectEnvelopeRecipientOnBehalfOfRoute } from './envelope-recipients/reject-envelope-recipient-on-behalf-of';
 import { reportRecipientRoute } from './envelope-recipients/report-recipient';
 import { updateEnvelopeRecipientsRoute } from './envelope-recipients/update-envelope-recipients';
+import { executeInternalDraftApprovedSendRoute } from './execute-internal-draft-approved-send';
 import { findEnvelopeAuditLogsRoute } from './find-envelope-audit-logs';
 import { findEnvelopesRoute } from './find-envelopes';
 import { getEditorEnvelopeRoute } from './get-editor-envelope';
@@ -35,10 +38,17 @@ import { getEnvelopeRoute } from './get-envelope';
 import { getEnvelopeItemsRoute } from './get-envelope-items';
 import { getEnvelopeItemsByTokenRoute } from './get-envelope-items-by-token';
 import { getEnvelopesByIdsRoute } from './get-envelopes-by-ids';
+import { getInternalDraftApprovalPolicyRoute } from './get-internal-draft-approval-policy';
+import { getInternalDraftPreparedArtifactRoute } from './get-internal-draft-prepared-artifact';
 import { getInternalDraftReviewRoute } from './get-internal-draft-review';
+import {
+  dispatchInternalDraftSendOperationRoute,
+  getInternalDraftSendOperationRoute,
+} from './internal-draft-send-operation';
 import { redistributeEnvelopeRoute } from './redistribute-envelope';
 import { replaceEnvelopeItemPdfRoute } from './replace-envelope-item-pdf';
 import { requestInternalDraftReviewRoute } from './request-internal-draft-review';
+import { retireInternalDraftPreparedArtifactsRoute } from './retire-internal-draft-prepared-artifacts';
 import { saveAsTemplateRoute } from './save-as-template';
 import { setEnvelopeFieldsRoute } from './set-envelope-fields';
 import { setEnvelopeRecipientsRoute } from './set-envelope-recipients';
@@ -55,6 +65,14 @@ import { useEnvelopeRoute } from './use-envelope';
  */
 export const envelopeRouter = router({
   internalDraftReview: {
+    configurePolicy: configureInternalDraftApprovalPolicyRoute,
+    getPolicy: getInternalDraftApprovalPolicyRoute,
+    getPreparedArtifact: getInternalDraftPreparedArtifactRoute,
+    executeSend: executeInternalDraftApprovedSendRoute,
+    getSendOperation: getInternalDraftSendOperationRoute,
+    dispatchSendOperation: dispatchInternalDraftSendOperationRoute,
+    retirePreparedArtifacts: retireInternalDraftPreparedArtifactsRoute,
+    changeLifecycle: changeInternalDraftReviewLifecycleRoute,
     get: getInternalDraftReviewRoute,
     request: requestInternalDraftReviewRoute,
     decide: decideInternalDraftReviewRoute,

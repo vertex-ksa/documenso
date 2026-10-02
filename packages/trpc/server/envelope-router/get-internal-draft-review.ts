@@ -10,6 +10,12 @@ export const getInternalDraftReviewRoute = authenticatedProcedure
   .input(ZGetInternalDraftReviewRequestSchema)
   .output(ZGetInternalDraftReviewResponseSchema)
   .query(async ({ input, ctx }) => {
-    const { envelopeId, reviewId } = input;
-    return await readInternalDraftReview({ envelopeId, reviewId, userId: ctx.user.id, teamId: ctx.teamId });
+    const { envelopeId, reviewId, operationKey } = input;
+    return await readInternalDraftReview({
+      envelopeId,
+      reviewId,
+      operationKey,
+      userId: ctx.user.id,
+      teamId: ctx.teamId,
+    });
   });

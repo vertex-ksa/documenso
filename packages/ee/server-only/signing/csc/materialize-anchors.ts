@@ -4,11 +4,13 @@ import { getFileServerSide } from '@documenso/lib/universal/upload/get-file.serv
 import { putPdfFileServerSide } from '@documenso/lib/universal/upload/put-file.server';
 import { prisma } from '@documenso/prisma';
 import { PDF } from '@libpdf/core';
+import type { Envelope, Field, Prisma, Recipient } from '@prisma/client';
 
 import { buildTspAnchorName, buildTspStampName } from './pdf-names';
 
 export type MaterializeTspAnchorsForEnvelopeOptions = {
   envelopeId: string;
+  tx?: Prisma.TransactionClient;
 };
 
 /**
@@ -29,8 +31,10 @@ export type MaterializeTspAnchorsForEnvelopeOptions = {
  */
 export const materializeTspAnchorsForEnvelope = async ({
   envelopeId,
+  tx,
 }: MaterializeTspAnchorsForEnvelopeOptions): Promise<void> => {
-  const envelope = await prisma.envelope.findUnique({
+  const db = tx ?? prisma;
+  const envelope = await db.envelope.findUnique({
     where: {
       id: envelopeId,
     },
@@ -66,103 +70,11 @@ export const materializeTspAnchorsForEnvelope = async ({
   }
 
   for (const envelopeItem of envelope.envelopeItems) {
-    const expectedAnchorNames = envelope.recipients.map((recipient) =>
-      buildTspAnchorName(recipient.id, envelopeItem.id),
-    );
-
-    const expectedStampNames: string[] = [];
-
-    for (const recipient of envelope.recipients) {
-      const pagesWithFields = new Set<number>();
-
-      for (const field of envelope.fields) {
-        if (field.recipientId === recipient.id && field.envelopeItemId === envelopeItem.id) {
-          pagesWithFields.add(field.page);
-        }
-      }
-
-      for (const page of pagesWithFields) {
-        expectedStampNames.push(buildTspStampName(recipient.id, envelopeItem.id, page));
-      }
-    }
-
     const bytes = await getFileServerSide(envelopeItem.documentData);
-    const pdfDoc = await PDF.load(bytes);
-
-    if (isAlreadyMaterialised(pdfDoc, expectedAnchorNames, expectedStampNames)) {
+    const newBytes = await renderTspAnchors({ envelope, envelopeItemId: envelopeItem.id, bytes });
+    if (newBytes.equals(Buffer.from(bytes))) {
       continue;
     }
-
-    // Bake operator AcroForm, annotations and OCG layers into static graphics
-    // so the materialised PDF is a deterministic surface. `skipSignatures`
-    // preserves any operator-placed signature widgets and (on re-materialise)
-    // the TSP anchors created previously.
-    pdfDoc.flattenAll({
-      form: {
-        skipSignatures: true,
-      },
-    });
-
-    const form = pdfDoc.getOrCreateForm();
-
-    if (pdfDoc.getPageCount() === 0) {
-      throw new AppError(AppErrorCode.INVALID_REQUEST, {
-        message: `Envelope item ${envelopeItem.id} PDF has no pages`,
-      });
-    }
-
-    // Anchors are AcroForm signature fields with no pre-attached widget.
-    // libpdf forbids `drawField` for signature fields — at sign time
-    // `pdf.sign({ fieldName })` promotes the existing field dict in place
-    // to a merged field/widget (Type=Annot, Subtype=Widget, P=page0,
-    // Rect=[0,0,0,0]) without modifying the page object. That preserves the
-    // per-recipient `/ByteRange` invariant across sequential signatures.
-    for (const anchorName of expectedAnchorNames) {
-      if (form.getSignatureField(anchorName)) {
-        continue;
-      }
-
-      form.createSignatureField(anchorName);
-    }
-
-    for (const recipient of envelope.recipients) {
-      const pagesWithFields = new Set<number>();
-
-      for (const field of envelope.fields) {
-        if (field.recipientId === recipient.id && field.envelopeItemId === envelopeItem.id) {
-          pagesWithFields.add(field.page);
-        }
-      }
-
-      for (const pageNumber of pagesWithFields) {
-        const stampName = buildTspStampName(recipient.id, envelopeItem.id, pageNumber);
-        const page = pdfDoc.getPage(pageNumber - 1);
-
-        if (!page) {
-          throw new AppError(AppErrorCode.INVALID_REQUEST, {
-            message: `Envelope item ${envelopeItem.id} missing page ${pageNumber} referenced by field`,
-          });
-        }
-
-        const existing = page.getStampAnnotations().some((stamp) => stamp.stampName === stampName);
-
-        if (existing) {
-          continue;
-        }
-
-        page.addStampAnnotation({
-          name: stampName,
-          rect: {
-            x: 0,
-            y: 0,
-            width: page.width,
-            height: page.height,
-          },
-        });
-      }
-    }
-
-    const newBytes = await pdfDoc.save({ useXRefStream: true });
 
     // CRITICAL: persist via `putPdfFileServerSide` (raw). The normalised path
     // would call `form.flatten()` without `skipSignatures` and wipe anchors.
@@ -175,12 +87,13 @@ export const materializeTspAnchorsForEnvelope = async ({
         arrayBuffer: async () => Promise.resolve(newBytes),
       },
       envelopeItem.documentData.initialData ?? undefined,
+      db,
     );
 
     // Copy the persisted bytes reference (S3 key or BYTES_64 payload) onto the
     // existing DocumentData row in place. `envelopeItem.documentDataId` stays
     // put — see file-level docblock for the rationale.
-    await prisma.documentData.update({
+    await db.documentData.update({
       where: { id: envelopeItem.documentDataId },
       data: {
         type: uploaded.documentData.type,
@@ -188,6 +101,119 @@ export const materializeTspAnchorsForEnvelope = async ({
       },
     });
   }
+};
+
+// Pure preparation shared by review staging and native distribution. No upload,
+// current document pointer change or external signing operation occurs here.
+export const renderTspAnchors = async ({
+  envelope,
+  envelopeItemId,
+  bytes,
+}: {
+  envelope: Pick<Envelope, 'signatureLevel'> & {
+    recipients: Pick<Recipient, 'id'>[];
+    fields: Pick<Field, 'recipientId' | 'envelopeItemId' | 'page'>[];
+  };
+  envelopeItemId: string;
+  bytes: Uint8Array;
+}): Promise<Buffer> => {
+  if (!isTspEnvelope(envelope) || envelope.recipients.length === 0) {
+    return Buffer.from(bytes);
+  }
+  const expectedAnchorNames = envelope.recipients.map((recipient) => buildTspAnchorName(recipient.id, envelopeItemId));
+
+  const expectedStampNames: string[] = [];
+
+  for (const recipient of envelope.recipients) {
+    const pagesWithFields = new Set<number>();
+
+    for (const field of envelope.fields) {
+      if (field.recipientId === recipient.id && field.envelopeItemId === envelopeItemId) {
+        pagesWithFields.add(field.page);
+      }
+    }
+
+    for (const page of pagesWithFields) {
+      expectedStampNames.push(buildTspStampName(recipient.id, envelopeItemId, page));
+    }
+  }
+
+  const pdfDoc = await PDF.load(bytes);
+
+  if (isAlreadyMaterialised(pdfDoc, expectedAnchorNames, expectedStampNames)) {
+    return Buffer.from(bytes);
+  }
+
+  // Bake operator AcroForm, annotations and OCG layers into static graphics
+  // so the materialised PDF is a deterministic surface. `skipSignatures`
+  // preserves any operator-placed signature widgets and (on re-materialise)
+  // the TSP anchors created previously.
+  pdfDoc.flattenAll({
+    form: {
+      skipSignatures: true,
+    },
+  });
+
+  const form = pdfDoc.getOrCreateForm();
+
+  if (pdfDoc.getPageCount() === 0) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, {
+      message: `Envelope item ${envelopeItemId} PDF has no pages`,
+    });
+  }
+
+  // Anchors are AcroForm signature fields with no pre-attached widget.
+  // libpdf forbids `drawField` for signature fields — at sign time
+  // `pdf.sign({ fieldName })` promotes the existing field dict in place
+  // to a merged field/widget (Type=Annot, Subtype=Widget, P=page0,
+  // Rect=[0,0,0,0]) without modifying the page object. That preserves the
+  // per-recipient `/ByteRange` invariant across sequential signatures.
+  for (const anchorName of expectedAnchorNames) {
+    if (form.getSignatureField(anchorName)) {
+      continue;
+    }
+
+    form.createSignatureField(anchorName);
+  }
+
+  for (const recipient of envelope.recipients) {
+    const pagesWithFields = new Set<number>();
+
+    for (const field of envelope.fields) {
+      if (field.recipientId === recipient.id && field.envelopeItemId === envelopeItemId) {
+        pagesWithFields.add(field.page);
+      }
+    }
+
+    for (const pageNumber of pagesWithFields) {
+      const stampName = buildTspStampName(recipient.id, envelopeItemId, pageNumber);
+      const page = pdfDoc.getPage(pageNumber - 1);
+
+      if (!page) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: `Envelope item ${envelopeItemId} missing page ${pageNumber} referenced by field`,
+        });
+      }
+
+      const existing = page.getStampAnnotations().some((stamp) => stamp.stampName === stampName);
+
+      if (existing) {
+        continue;
+      }
+
+      page.addStampAnnotation({
+        name: stampName,
+        rect: {
+          x: 0,
+          y: 0,
+          width: page.width,
+          height: page.height,
+        },
+      });
+    }
+  }
+
+  return Buffer.from(await pdfDoc.save({ useXRefStream: true }));
 };
 
 /**

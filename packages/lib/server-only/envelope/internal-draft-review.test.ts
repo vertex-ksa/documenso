@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  changeInternalDraftReviewLifecycle,
+  configureInternalDraftApprovalPolicy,
   decideInternalDraftReview,
   readInternalDraftReview,
   requestInternalDraftReview,
+  retireInternalDraftPreparedArtifacts,
 } from './internal-draft-review';
 import type { ReviewEnvelope } from './internal-draft-review-snapshot';
 import { createInternalDraftSnapshot } from './internal-draft-review-snapshot';
@@ -11,21 +14,29 @@ const doubles = vi.hoisted(() => ({
   tx: {
     $queryRaw: vi.fn(),
     user: { findFirst: vi.fn() },
+    documentData: { deleteMany: vi.fn(async () => ({ count: 1 })) },
     team: { findFirst: vi.fn() },
     envelope: { findFirst: vi.fn() },
     internalDraftReview: {
       findUnique: vi.fn(),
       findFirst: vi.fn(),
       create: vi.fn(),
+      update: vi.fn(),
       updateMany: vi.fn(),
       findUniqueOrThrow: vi.fn(),
     },
+    internalDraftApprovalPolicyRevision: { upsert: vi.fn(async () => ({})), create: vi.fn(async () => ({})) },
+    internalDraftApprovalPolicy: { upsert: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
   },
   transaction: vi.fn(),
 }));
 vi.mock('@documenso/prisma', () => ({ prisma: { $transaction: doubles.transaction } }));
 vi.mock('../../universal/upload/get-file.server', () => ({
   getFileServerSide: async ({ data }: { data: string }) => Buffer.from(data),
+}));
+
+vi.mock('./internal-draft-review-preparation', () => ({
+  prepareInternalDraftReviewArtifacts: async () => ({ preparedArtifacts: [], preparedHash: 'b'.repeat(64) }),
 }));
 
 const draft = () =>
@@ -66,6 +77,7 @@ let envelope: ReviewEnvelope;
 let roles: Map<number, string>;
 let disabled: Set<number>;
 let stored: Record<string, unknown> | null;
+let policy: Record<string, unknown> | null;
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
@@ -100,6 +112,16 @@ beforeEach(() => {
   ]);
   disabled = new Set();
   stored = null;
+  policy = null;
+  doubles.tx.internalDraftApprovalPolicy.upsert.mockImplementation(({ create, update }) => {
+    policy = policy ? { ...policy, ...update } : { version: 1, required: true, selectedReviewId: null, ...create };
+    return policy;
+  });
+  doubles.tx.internalDraftApprovalPolicy.findUnique.mockImplementation(() => policy);
+  doubles.tx.internalDraftApprovalPolicy.update.mockImplementation(({ data }) => {
+    policy = { ...policy, ...data };
+    return policy;
+  });
   doubles.transaction.mockImplementation(async (callback) => callback(doubles.tx));
   doubles.tx.$queryRaw.mockImplementation((strings, ...values) => {
     const sql = strings.join('');
@@ -122,12 +144,26 @@ beforeEach(() => {
       ? envelope
       : null;
   });
-  doubles.tx.internalDraftReview.findUnique.mockImplementation(async () => stored);
+  doubles.tx.internalDraftReview.findUnique.mockImplementation(({ where }) => {
+    const key = where.envelopeId_requesterUserId_operationKey;
+    return stored &&
+      (!key ||
+        (key.operationKey === stored.operationKey &&
+          key.requesterUserId === stored.requesterUserId &&
+          key.envelopeId === stored.envelopeId))
+      ? stored
+      : null;
+  });
   doubles.tx.internalDraftReview.findFirst.mockImplementation(async ({ where }) =>
-    stored?.id === where.id && stored?.envelopeId === where.envelopeId ? stored : null,
+    stored?.envelopeId === where.envelopeId &&
+    (where.id
+      ? stored?.id === where.id
+      : stored?.operationKey === where.operationKey && stored?.requesterUserId === where.requesterUserId)
+      ? stored
+      : null,
   );
   doubles.tx.internalDraftReview.create.mockImplementation(({ data }) => {
-    stored = { ...data, id: 'review-1', status: 'PENDING', policyVersion: 1, createdAt: new Date(), decidedAt: null };
+    stored = { policyVersion: 1, ...data, id: 'review-1', status: 'PENDING', createdAt: new Date(), decidedAt: null };
     return stored;
   });
   doubles.tx.internalDraftReview.updateMany.mockImplementation(({ where, data }) => {
@@ -138,9 +174,56 @@ beforeEach(() => {
     return { count: 1 };
   });
   doubles.tx.internalDraftReview.findUniqueOrThrow.mockImplementation(async () => stored);
+  doubles.tx.internalDraftReview.update.mockImplementation(({ data }) => {
+    stored = { ...stored, ...data };
+    return stored;
+  });
 });
 
 describe('native internal draft review record service (isolated Prisma doubles)', () => {
+  it('withdraws pending requests and revokes approvals without overwriting their decisions', async () => {
+    const first = await requestInternalDraftReview(request());
+    await changeInternalDraftReviewLifecycle({
+      userId: 1,
+      teamId: 4,
+      envelopeId: 'env-review',
+      reviewId: first.id,
+      action: 'WITHDRAW',
+      reason: 'Revised scope',
+    });
+    await expect(decideInternalDraftReview(decide(first.snapshotHash))).rejects.toThrow('withdrawn');
+    const second = await requestInternalDraftReview({ ...request(), operationKey: 'review-operation-0002' });
+    await decideInternalDraftReview({ ...decide(second.snapshotHash), reviewId: second.id });
+    const revoked = await changeInternalDraftReviewLifecycle({
+      userId: 2,
+      teamId: 4,
+      envelopeId: 'env-review',
+      reviewId: second.id,
+      action: 'REVOKE',
+      reason: 'Terms need renewed review',
+    });
+    expect(revoked).toMatchObject({ status: 'APPROVED', revokedAt: expect.any(Date) });
+    await expect(decideInternalDraftReview({ ...decide(second.snapshotHash), reviewId: second.id })).rejects.toThrow(
+      'revoked',
+    );
+  });
+
+  it('requires current admin and version for policy edits, superseding old review authority', async () => {
+    const first = await requestInternalDraftReview(request());
+    const options = { userId: 3, teamId: 4, envelopeId: 'env-review', expectedVersion: 1, required: false };
+    await expect(configureInternalDraftApprovalPolicy(options)).rejects.toThrow('administrator');
+    roles.set(3, 'ADMIN');
+    await expect(configureInternalDraftApprovalPolicy({ ...options, expectedVersion: 0 })).rejects.toThrow('changed');
+    expect(await configureInternalDraftApprovalPolicy(options)).toMatchObject({
+      version: 2,
+      required: false,
+      selectedReviewId: null,
+    });
+    await expect(decideInternalDraftReview(decide(first.snapshotHash))).rejects.toThrow('superseded');
+    expect(
+      (await requestInternalDraftReview({ ...request(), operationKey: 'review-operation-0002' })).policyVersion,
+    ).toBe(2);
+  });
   it('defaults to disabled before querying native data', async () => {
     vi.stubEnv('NEXT_PRIVATE_INTERNAL_DRAFT_REVIEW_ENABLED', 'false');
     await expect(requestInternalDraftReview(request())).rejects.toThrow('not enabled');
@@ -149,9 +232,12 @@ describe('native internal draft review record service (isolated Prisma doubles)'
 
   it('stores a material snapshot without signer tokens and never authorizes send', async () => {
     const result = await requestInternalDraftReview(request());
-    expect(result).toMatchObject({ status: 'PENDING', canAuthorizeSend: false, sendEnforcement: 'NOT_INTEGRATED' });
+    expect(result).toMatchObject({ status: 'PENDING', canAuthorizeSend: false, sendEnforcement: 'NATIVE_TRANSACTIONAL_SEND' });
     expect(JSON.stringify(stored)).not.toContain('PRIVATE-TOKEN');
-    expect(doubles.transaction).toHaveBeenCalledWith(expect.any(Function), { isolationLevel: 'Serializable' });
+    expect(doubles.transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: 'Serializable',
+      timeout: 60000,
+    });
   });
 
   it('replays the same operation without a second review; changed content conflicts', async () => {
@@ -199,7 +285,11 @@ describe('native internal draft review record service (isolated Prisma doubles)'
     expect(record).not.toHaveProperty('snapshot');
     envelope.title = 'New draft';
     expect(await readInternalDraftReview(options)).toMatchObject({ materialMatches: false, canRecordDecision: false });
-    await expect(readInternalDraftReview({ ...options, userId: 3 })).rejects.toThrow('not found for this actor');
+    expect(await readInternalDraftReview({ ...options, userId: 3 })).toMatchObject({
+      canRecordDecision: false,
+      canRevokeReview: false,
+    });
+    await expect(readInternalDraftReview({ ...options, userId: 99 })).rejects.toThrow('membership');
   });
 
   it('rechecks designated reviewer role and active account at decision time', async () => {
@@ -220,6 +310,51 @@ describe('native internal draft review record service (isolated Prisma doubles)'
     await expect(decideInternalDraftReview(decide('a'.repeat(64)))).rejects.toThrow('draft changed');
     vi.setSystemTime(request().expiresAt);
     await expect(decideInternalDraftReview(decide(pending.snapshotHash))).rejects.toThrow('expired');
+  });
+
+  it('recovers a request by its operation key only for its current native requester', async () => {
+    const pending = await requestInternalDraftReview(request());
+    const locator = { envelopeId: request().envelopeId, teamId: 4, operationKey: request().operationKey };
+    expect((await readInternalDraftReview({ ...locator, userId: request().userId })).id).toBe(pending.id);
+    await expect(readInternalDraftReview({ ...locator, userId: 3 })).rejects.toThrow('not found');
+    await expect(
+      readInternalDraftReview({ ...locator, userId: request().userId, reviewId: pending.id }),
+    ).rejects.toThrow('exactly one');
+  });
+
+  it('retires only detached private staged rows after terminal retention under current administrator authority', async () => {
+    roles.set(3, 'ADMIN');
+    const pending = await requestInternalDraftReview(request());
+    if (!stored) {
+      throw new Error('Missing record');
+    }
+    stored.preparedArtifacts = [
+      {
+        envelopeItemId: 'item',
+        originalDocumentDataId: 'current',
+        stagedDocumentDataId: 'staged',
+        sha256: 'a'.repeat(64),
+      },
+    ];
+    await expect(
+      retireInternalDraftPreparedArtifacts({ ...request(), userId: 3, reviewId: pending.id }),
+    ).rejects.toThrow('retention');
+    await changeInternalDraftReviewLifecycle({
+      ...request(),
+      reviewId: pending.id,
+      action: 'WITHDRAW',
+      reason: 'Replace draft',
+    });
+    vi.setSystemTime(new Date(Date.now() + 31 * 86400000));
+    await expect(
+      retireInternalDraftPreparedArtifacts({ ...request(), userId: 2, reviewId: pending.id }),
+    ).rejects.toThrow('administrator');
+    expect(await retireInternalDraftPreparedArtifacts({ ...request(), userId: 3, reviewId: pending.id })).toMatchObject(
+      { retired: true },
+    );
+    expect(doubles.tx.documentData.deleteMany).toHaveBeenCalledWith({
+      where: { id: 'staged', type: 'BYTES_64', envelopeItem: null },
+    });
   });
 
   it('detects PDF byte and recipient changes before a decision', async () => {
@@ -257,7 +392,7 @@ describe('native internal draft review record service (isolated Prisma doubles)'
     if (!stored) {
       throw new Error('Missing test review');
     }
-    stored.policyVersion = 2;
+    stored.policyVersion = 0;
     await expect(decideInternalDraftReview(decide(pending.snapshotHash))).rejects.toThrow('Unsupported');
     expect(doubles.tx.internalDraftReview.updateMany).not.toHaveBeenCalled();
   });

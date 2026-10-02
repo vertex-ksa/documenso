@@ -1,5 +1,5 @@
 import { prisma } from '@documenso/prisma';
-import type { DocumentDataType } from '@prisma/client';
+import type { DocumentDataType, Prisma } from '@prisma/client';
 
 export type CreateDocumentDataOptions = {
   type: DocumentDataType;
@@ -13,8 +13,11 @@ export type CreateDocumentDataOptions = {
   initialData?: string;
 };
 
-export const createDocumentData = async ({ type, data, initialData }: CreateDocumentDataOptions) => {
-  return await prisma.documentData.create({
+export const createDocumentData = async (
+  { type, data, initialData }: CreateDocumentDataOptions,
+  db: Pick<Prisma.TransactionClient, 'documentData'> = prisma,
+) => {
+  return await db.documentData.create({
     data: {
       type,
       data,

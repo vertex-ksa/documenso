@@ -487,6 +487,9 @@ model Envelope {
 
   envelopeAttachments EnvelopeAttachment[]
   internalDraftReviews InternalDraftReview[]
+  internalDraftApprovalPolicy InternalDraftApprovalPolicy?
+  internalDraftSendOperations InternalDraftSendOperation[]
+  internalDraftPolicyRevisions InternalDraftApprovalPolicyRevision[]
 
   @@index([type])
   @@index([status])
@@ -513,9 +516,28 @@ model InternalDraftReview {
   expiresAt DateTime
   decidedAt DateTime?
   decisionUserId Int?
+  withdrawnAt DateTime?
+  withdrawnUserId Int?
+  withdrawalReason String?
+  preparedArtifacts Json?
+  preparedHash String?
+  preparedRetiredAt DateTime?
+  revokedAt DateTime?
+  revokedUserId Int?
+  revocationReason String?
 
   @@unique([envelopeId, requesterUserId, operationKey])
   @@index([envelopeId, createdAt])
+}
+
+model InternalDraftApprovalPolicy {
+  envelopeId String @id
+  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  version Int @default(1)
+  required Boolean @default(true)
+  selectedReviewId String?
+  configuredByUserId Int
+  configuredAt DateTime @default(now())
 }
 
 enum InternalDraftReviewStatus {
@@ -1302,4 +1324,31 @@ model RateLimit {
 
   @@id([key, action, bucket])
   @@index([createdAt])
+}
+
+model InternalDraftSendOperation {
+  id String @id @default(cuid())
+  envelopeId String
+  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  operationKey String
+  reviewId String @unique
+  userId Int
+  policyVersion Int
+  preparedHash String
+  outboundIntents Json
+  dispatchState String @default("PENDING")
+  nextIntent Int @default(0)
+  createdAt DateTime @default(now())
+  dispatchedAt DateTime?
+  @@unique([envelopeId, userId, operationKey])
+}
+
+model InternalDraftApprovalPolicyRevision {
+  envelopeId String
+  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  version Int
+  required Boolean
+  configuredByUserId Int
+  configuredAt DateTime @default(now())
+  @@id([envelopeId, version])
 }

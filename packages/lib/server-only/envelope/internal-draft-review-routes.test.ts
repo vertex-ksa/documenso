@@ -3,15 +3,28 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { TrpcContext } from '../../../trpc/server/context';
 import { decideInternalDraftReviewRoute } from '../../../trpc/server/envelope-router/decide-internal-draft-review';
+import { executeInternalDraftApprovedSendRoute } from '../../../trpc/server/envelope-router/execute-internal-draft-approved-send';
 import { getInternalDraftReviewRoute } from '../../../trpc/server/envelope-router/get-internal-draft-review';
+import { dispatchInternalDraftSendOperationRoute } from '../../../trpc/server/envelope-router/internal-draft-send-operation';
 import { requestInternalDraftReviewRoute } from '../../../trpc/server/envelope-router/request-internal-draft-review';
 import { router } from '../../../trpc/server/trpc';
 
-const service = vi.hoisted(() => ({ request: vi.fn(), decide: vi.fn(), read: vi.fn() }));
+const service = vi.hoisted(() => ({
+  request: vi.fn(),
+  decide: vi.fn(),
+  read: vi.fn(),
+  execute: vi.fn(),
+  dispatch: vi.fn(),
+}));
 vi.mock('./internal-draft-review', () => ({
   requestInternalDraftReview: service.request,
   decideInternalDraftReview: service.decide,
   readInternalDraftReview: service.read,
+}));
+vi.mock('./internal-draft-approved-send', () => ({
+  executeInternalDraftApprovedSend: service.execute,
+  dispatchInternalDraftSendOperation: service.dispatch,
+  readInternalDraftSendOperation: vi.fn(),
 }));
 vi.mock('../public-api/get-api-token-by-token', () => ({ getApiTokenByToken: vi.fn() }));
 
@@ -19,6 +32,8 @@ const routes = router({
   request: requestInternalDraftReviewRoute,
   decide: decideInternalDraftReviewRoute,
   get: getInternalDraftReviewRoute,
+  execute: executeInternalDraftApprovedSendRoute,
+  dispatch: dispatchInternalDraftSendOperationRoute,
 });
 const context = (): TrpcContext => ({
   user: {
@@ -57,17 +72,50 @@ const result = () => ({
   expiresAt: new Date('2026-10-03T12:00:00Z'),
   decidedAt: null,
   canAuthorizeSend: false,
-  sendEnforcement: 'NOT_INTEGRATED',
+  sendEnforcement: 'NATIVE_TRANSACTIONAL_SEND',
 });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  service.execute.mockResolvedValue({
+    id: 'op',
+    reviewId: 'review-1',
+    dispatchState: 'PENDING',
+    createdAt: new Date(),
+  });
+  service.dispatch.mockResolvedValue({ id: 'op', dispatchState: 'UNKNOWN', deliveryConfirmed: false });
   service.request.mockResolvedValue(result());
   service.decide.mockResolvedValue({ ...result(), status: 'APPROVED' });
   service.read.mockResolvedValue({ ...result(), materialMatches: true, expired: false, canRecordDecision: true });
 });
 
 describe('native internal draft review route boundary (synthetic native context)', () => {
+  it('binds protected send and dispatch to the authenticated native actor/team', async () => {
+    await routes.createCaller(context()).execute({
+      envelopeId: 'env-1',
+      reviewId: 'review-1',
+      preparedHash: 'b'.repeat(64),
+      operationKey: 'send_operation_123',
+      userId: 99,
+      teamId: 999,
+    } as never);
+    expect(service.execute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 1,
+        teamId: 4,
+        requestMetadata: expect.objectContaining({ auth: 'session', auditUser: expect.objectContaining({ id: 1 }) }),
+      }),
+    );
+    await routes
+      .createCaller(context())
+      .dispatch({ envelopeId: 'env-1', operationKey: 'send_operation_123', userId: 99, teamId: 999 } as never);
+    expect(service.dispatch).toHaveBeenCalledWith({
+      envelopeId: 'env-1',
+      operationKey: 'send_operation_123',
+      userId: 1,
+      teamId: 4,
+    });
+  });
   it('uses native session actor/team and omits spoofed payload identities', async () => {
     const input = {
       envelopeId: 'env-1',

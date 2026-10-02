@@ -15,6 +15,7 @@ const fixture = ({
   invalidField = false,
   tsp = false,
   ccOnly = false,
+  fullCommit = false,
 } = {}) => {
   const effects = [];
   const envelope = {
@@ -35,7 +36,18 @@ const fixture = ({
     team: { organisation: { organisationClaim: { recipientCount: 0 } } },
   };
   const context = {
+    assertInternalDraftSendPolicy: async () => {},
+    createDocumentAuditLogData: (value) => value,
+    resolveExpiresAt: () => null,
+    extractDerivedDocumentEmailSettings: () => ({ recipientSigningRequest: true }),
+    WebhookTriggerEvents: { DOCUMENT_SENT: 'DOCUMENT_SENT' },
+    mapEnvelopeToWebhookDocumentPayload: (value) => value,
+    ZWebhookDocumentSchema: { parse: (value) => value },
+    triggerWebhook: async () => { effects.push('webhook'); },
+    DOCUMENT_AUDIT_LOG_TYPE: { DOCUMENT_SENT: 'DOCUMENT_SENT' },
+    testEffects: effects,
     console,
+    Prisma: { TransactionIsolationLevel: { Serializable: 'Serializable' } },
     Buffer,
     AppError: class extends Error {
       constructor(code, options) {
@@ -53,7 +65,7 @@ const fixture = ({
     assertUserNotDisabledById: async () => {},
     getEnvelopeWhereInput: async () => ({ envelopeWhereInput: {} }),
     prisma: {
-      envelope: { findFirst: async () => envelope, findFirstOrThrow: async () => envelope },
+      envelope: { findFirst: async () => envelope, findFirstOrThrow: async () => envelope, update: async () => { effects.push('pending'); return {...envelope,status:'PENDING'}; } },
       documentMeta: {
         update: async () => {
           effects.push('meta-update');
@@ -64,10 +76,9 @@ const fixture = ({
           effects.push('item-update');
         },
       },
-      $transaction: async () => {
-        effects.push('transaction');
-        throw new Error('validated-boundary');
-      },
+      $queryRaw: async () => [],
+      documentAuditLog: { create: async () => { effects.push('transaction'); if (!fullCommit) throw new Error('validated-boundary'); return {};  } },
+      $transaction: async (callback) => callback(context.prisma),
     },
     isDocumentCompleted: () => false,
     mapSecondaryIdToDocumentId: () => 1,
@@ -101,8 +112,8 @@ const fixture = ({
     },
   };
   vm.createContext(context);
-  vm.runInContext(executable + '\nglobalThis.invokeSend = sendDocument;', context);
-  return { effects, send: () => context.invokeSend({ id: {}, userId: 1, teamId: 1 }) };
+  vm.runInContext(executable + '\nglobalThis.invokeSend = sendDocument; globalThis.invokeApproved = (options) => sendDocumentWithContext(options, {tx: prisma, prepared: true, approved: true, enqueue: async (effect) => { testEffects.push("queued-"+effect.kind); }});', context);
+  return { effects, send: () => context.invokeSend({ id: {}, userId: 1, teamId: 1 }), approved: () => context.invokeApproved({id:{},userId:1,teamId:1}) };
 };
 
 test('auth-required recipient denial does not render or persist a prefilled draft', async () => {
@@ -117,7 +128,7 @@ test('missing signature field denial does not render or persist a prefilled draf
   assert.deepEqual(effects, []);
 });
 
-test('valid recipients still materialize prefilled PDFs before the send transaction', async () => {
+test('valid recipients still materialize prefilled PDFs within the native send transaction', async () => {
   const { send, effects } = fixture();
   await assert.rejects(send(), { message: 'validated-boundary' });
   assert.deepEqual(effects, ['file-read', 'pdf-render', 'file-write', 'item-update', 'transaction']);
@@ -146,8 +157,15 @@ test('valid TSP still persists sequential coercion and anchors before send trans
     'transaction',
   ]);
 });
-test('CC-only path still prefills and requests sealing without entering the send transaction', async () => {
+test('CC-only path still prefills and requests sealing after preparation commits', async () => {
   const { send, effects } = fixture({ ccOnly: true });
   await send();
   assert.deepEqual(effects, ['file-read', 'pdf-render', 'file-write', 'item-update', 'job']);
+});
+
+test('actual native approved send context reuses staged bytes and records native transition with queued effects', async () => {
+  const {approved,effects}=fixture({fullCommit:true,tsp:true});
+  const result=await approved();
+  assert.equal(result.status,'PENDING');
+  assert.deepEqual(effects,['meta-update','transaction','pending','queued-JOB','queued-WEBHOOK']);
 });

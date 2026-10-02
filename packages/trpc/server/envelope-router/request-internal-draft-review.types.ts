@@ -11,10 +11,20 @@ export const ZInternalDraftReviewResponseSchema = z.object({
   id: z.string(),
   status: z.enum(['PENDING', 'APPROVED', 'REJECTED']),
   snapshotHash: z.string().regex(/^[a-f0-9]{64}$/),
-  policyVersion: z.literal(1),
+  policyVersion: z.number().int().positive(),
   expiresAt: z.date(),
   createdAt: z.date(),
   decidedAt: z.date().nullable(),
+  withdrawnAt: z.date().nullable().default(null),
+  revokedAt: z.date().nullable().default(null),
+  preparedHash: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .nullable()
+    .default(null),
+  preparedItems: z
+    .array(z.object({ envelopeItemId: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/) }))
+    .default([]),
   canAuthorizeSend: z.literal(false),
-  sendEnforcement: z.literal('NOT_INTEGRATED'),
+  sendEnforcement: z.literal('NATIVE_TRANSACTIONAL_SEND'),
 });
