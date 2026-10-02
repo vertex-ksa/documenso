@@ -38,15 +38,15 @@ type EnvelopeIdRef = Pick<Envelope, 'id'>;
  *   terminal states, to stay consistent with the existing envelope-state error
  *   vocabulary.
  */
-export function assertEnvelopeMutable(envelope: EnvelopeMutableSnapshot): Promise<void>;
+export function assertEnvelopeMutable(envelope: EnvelopeMutableSnapshot): void;
 export function assertEnvelopeMutable(envelope: EnvelopeIdRef, tx: Prisma.TransactionClient): Promise<void>;
 
-export async function assertEnvelopeMutable(
+export function assertEnvelopeMutable(
   envelope: EnvelopeMutableSnapshot | EnvelopeIdRef,
   tx?: Prisma.TransactionClient,
-): Promise<void> {
+): void | Promise<void> {
   if (tx) {
-    return await refetchAndAssert(tx, (envelope as EnvelopeIdRef).id);
+    return refetchAndAssert(tx, (envelope as EnvelopeIdRef).id);
   }
 
   assertSnapshotMutable(envelope as EnvelopeMutableSnapshot);
