@@ -128,23 +128,10 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
 
   let signingOrder = envelope.documentMeta?.signingOrder || DocumentSigningOrder.PARALLEL;
 
-  if (isTspEnvelope(envelope) && signingOrder === DocumentSigningOrder.PARALLEL && envelope.documentMeta) {
-    console.warn(
-      `[CSC] Coercing signingOrder=PARALLEL → SEQUENTIAL for ${envelope.signatureLevel} envelope ${envelope.id} at send time. The schema-layer guard should have caught this earlier.`,
-    );
-
-    await prisma.documentMeta.update({
-      where: {
-        id: envelope.documentMeta.id,
-      },
-      data: {
-        signingOrder: DocumentSigningOrder.SEQUENTIAL,
-      },
-    });
-
+  const mustCoerceSigningOrder =
+    isTspEnvelope(envelope) && signingOrder === DocumentSigningOrder.PARALLEL && !!envelope.documentMeta;
+  if (mustCoerceSigningOrder) {
     signingOrder = DocumentSigningOrder.SEQUENTIAL;
-
-    envelope.documentMeta.signingOrder = DocumentSigningOrder.SEQUENTIAL;
   }
 
   let recipientsToNotify = envelope.recipients;
@@ -191,7 +178,52 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
     });
   }
 
-  // Complete recipient validation before persisting prefilled PDF replacements.
+  const allRecipientsHaveNoActionToTake = envelope.recipients.every(
+    (recipient) => recipient.role === RecipientRole.CC || recipient.signingStatus === SigningStatus.SIGNED,
+  );
+
+  const fieldsToAutoInsert: { fieldId: number; customText: string }[] = [];
+
+  // Validate and autoinsert fields for V2 envelopes.
+  if (envelope.internalVersion === 2 && !allRecipientsHaveNoActionToTake) {
+    for (const unknownField of envelope.fields) {
+      const recipient = envelope.recipients.find((r) => r.id === unknownField.recipientId);
+
+      if (!recipient) {
+        throw new AppError(AppErrorCode.NOT_FOUND, {
+          message: 'Recipient not found',
+        });
+      }
+
+      const fieldToAutoInsert = extractFieldAutoInsertValues(unknownField, recipient);
+
+      // Only auto-insert fields if the recipient has not been sent the document yet.
+      if (fieldToAutoInsert && recipient.sendStatus !== SendStatus.SENT) {
+        fieldsToAutoInsert.push(fieldToAutoInsert);
+      }
+    }
+  }
+
+  if (mustCoerceSigningOrder && envelope.documentMeta) {
+    console.warn(
+      `[CSC] Coercing signingOrder=PARALLEL → SEQUENTIAL for ${envelope.signatureLevel} envelope ${envelope.id} at send time. The schema-layer guard should have caught this earlier.`,
+    );
+
+    await prisma.documentMeta.update({
+      where: {
+        id: envelope.documentMeta.id,
+      },
+      data: {
+        signingOrder: DocumentSigningOrder.SEQUENTIAL,
+      },
+    });
+
+    signingOrder = DocumentSigningOrder.SEQUENTIAL;
+
+    envelope.documentMeta.signingOrder = DocumentSigningOrder.SEQUENTIAL;
+  }
+
+  // Complete recipient and action-field validation before persisting send preparation.
   if (envelope.formValues && envelope.status === DocumentStatus.DRAFT) {
     await Promise.all(
       envelope.envelopeItems.map(async (envelopeItem) => {
@@ -199,10 +231,6 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
       }),
     );
   }
-
-  const allRecipientsHaveNoActionToTake = envelope.recipients.every(
-    (recipient) => recipient.role === RecipientRole.CC || recipient.signingStatus === SigningStatus.SIGNED,
-  );
 
   if (allRecipientsHaveNoActionToTake) {
     await jobs.triggerJob({
@@ -223,28 +251,6 @@ export const sendDocument = async ({ id, userId, teamId, sendEmail, requestMetad
         recipients: true,
       },
     });
-  }
-
-  const fieldsToAutoInsert: { fieldId: number; customText: string }[] = [];
-
-  // Validate and autoinsert fields for V2 envelopes.
-  if (envelope.internalVersion === 2) {
-    for (const unknownField of envelope.fields) {
-      const recipient = envelope.recipients.find((r) => r.id === unknownField.recipientId);
-
-      if (!recipient) {
-        throw new AppError(AppErrorCode.NOT_FOUND, {
-          message: 'Recipient not found',
-        });
-      }
-
-      const fieldToAutoInsert = extractFieldAutoInsertValues(unknownField, recipient);
-
-      // Only auto-insert fields if the recipient has not been sent the document yet.
-      if (fieldToAutoInsert && recipient.sendStatus !== SendStatus.SENT) {
-        fieldsToAutoInsert.push(fieldToAutoInsert);
-      }
-    }
   }
 
   if (isTspEnvelope(envelope) && envelope.status === DocumentStatus.DRAFT) {
@@ -522,4 +528,3 @@ export const extractFieldAutoInsertValues = (
 
   return null;
 };
-

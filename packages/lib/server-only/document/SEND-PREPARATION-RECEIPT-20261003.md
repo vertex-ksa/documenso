@@ -1,0 +1,7 @@
+# Validation before native send preparation
+
+Base review checkpoint: `5f9a4f10a3018ffdf7edac2d3db446a1a3f37da7`; branch `codex/tm50/sign-capabilities-20261002`.
+
+Two additional preparation effects followed ordinary denial: invalid advanced field metadata was discovered after prefilled PDF storage/item replacement, and an auth-required recipient denial followed persisted TSP signing-order coercion. Action-field validation now precedes preparation for recipients requiring actions; signing-order coercion persistence is deferred until recipient and action-field validation. The local intended sequential order still determines recipient notification selection. Valid TSP paths retain coercion, PDF preparation and anchor materialization order. CC-only paths retain PDF prefilling and their existing sealing request without action-field preparation or send transaction.
+
+Actual-source/double regression checks: unchanged base5/7 pass,2 denial tests fail; corrected7/7 pass. Separate snapshot mutability guard3/3 pass. Affected strict TypeScript passes for both native service files after repository-locked install and Prisma generators. Formatting/diff checks pass. No full build, database, provider signing, mail delivery or atomic approval-to-send proof. Persistent PDF/signing preparation is not made globally transactional by this ordering change; external storage failures and content/send races remain open. Internal review remains default disabled and cannot authorize send.
