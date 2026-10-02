@@ -486,6 +486,7 @@ model Envelope {
   documentMeta   DocumentMeta @relation(fields: [documentMetaId], references: [id])
 
   envelopeAttachments EnvelopeAttachment[]
+  internalDraftReviews InternalDraftReview[]
 
   @@index([type])
   @@index([status])
@@ -493,6 +494,34 @@ model Envelope {
   @@index([teamId])
   @@index([folderId])
   @@index([createdAt])
+}
+
+// Internal draft review records are separate from recipient APPROVER actions.
+// They do not authorize send until the material send boundary is integrated.
+model InternalDraftReview {
+  id String @id @default(cuid())
+  envelopeId String
+  envelope Envelope @relation(fields: [envelopeId], references: [id], onDelete: Cascade)
+  operationKey String
+  requesterUserId Int
+  reviewerUserId Int
+  policyVersion Int @default(1)
+  snapshotHash String
+  snapshot Json
+  status InternalDraftReviewStatus @default(PENDING)
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  decidedAt DateTime?
+  decisionUserId Int?
+
+  @@unique([envelopeId, requesterUserId, operationKey])
+  @@index([envelopeId, createdAt])
+}
+
+enum InternalDraftReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
 }
 
 model EnvelopeItem {

@@ -9,6 +9,7 @@ import { bulkMoveEnvelopesRoute } from './bulk-move-envelopes';
 import { cancelEnvelopeRoute } from './cancel-envelope';
 import { createEnvelopeRoute } from './create-envelope';
 import { createEnvelopeItemsRoute } from './create-envelope-items';
+import { decideInternalDraftReviewRoute } from './decide-internal-draft-review';
 import { deleteEnvelopeRoute } from './delete-envelope';
 import { deleteEnvelopeItemRoute } from './delete-envelope-item';
 import { distributeEnvelopeRoute } from './distribute-envelope';
@@ -34,8 +35,10 @@ import { getEnvelopeRoute } from './get-envelope';
 import { getEnvelopeItemsRoute } from './get-envelope-items';
 import { getEnvelopeItemsByTokenRoute } from './get-envelope-items-by-token';
 import { getEnvelopesByIdsRoute } from './get-envelopes-by-ids';
+import { getInternalDraftReviewRoute } from './get-internal-draft-review';
 import { redistributeEnvelopeRoute } from './redistribute-envelope';
 import { replaceEnvelopeItemPdfRoute } from './replace-envelope-item-pdf';
+import { requestInternalDraftReviewRoute } from './request-internal-draft-review';
 import { saveAsTemplateRoute } from './save-as-template';
 import { setEnvelopeFieldsRoute } from './set-envelope-fields';
 import { setEnvelopeRecipientsRoute } from './set-envelope-recipients';
@@ -51,6 +54,11 @@ import { useEnvelopeRoute } from './use-envelope';
  * Example: GET /envelope/attachment must appear before GET /envelope/:id
  */
 export const envelopeRouter = router({
+  internalDraftReview: {
+    get: getInternalDraftReviewRoute,
+    request: requestInternalDraftReviewRoute,
+    decide: decideInternalDraftReviewRoute,
+  },
   attachment: {
     find: findAttachmentsRoute,
     create: createAttachmentRoute,
